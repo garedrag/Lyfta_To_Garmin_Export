@@ -83,6 +83,8 @@ def write_env_file(values):
         "STRAVA_CALLBACK_URL={}".format(values.get("STRAVA_CALLBACK_URL", "http://localhost")),
         "LYFTA_CSV={}".format(values.get("LYFTA_CSV", "WorkoutData.csv")),
         "DAYS_BACK={}".format(values.get("DAYS_BACK", "30")),
+        "USER_WEIGHT_KG={}".format(values.get("USER_WEIGHT_KG", "")),
+        "STRENGTH_MET={}".format(values.get("STRENGTH_MET", "5.0")),
         "DAILY_SYNC_TIME={}".format(values.get("DAILY_SYNC_TIME", "08:00")),
         "",
     ]))
@@ -243,6 +245,18 @@ def rest_seconds_for_exercise_category(category):
     return 180 if category in large_muscle_categories else 120
 
 
+def planned_sets_duration_seconds(sets):
+    if not sets:
+        return 0
+    total = 0
+    for index, set_info in enumerate(sets):
+        category = exercise_category_for_name(set_info.get("exercise", ""))
+        total += 60
+        if index < len(sets) - 1:
+            total += rest_seconds_for_exercise_category(category)
+    return total
+
+
 def unique_exercises(sets):
     exercises = []
     indexes = {}
@@ -334,6 +348,8 @@ def build_fit(activity, lyfta_workout=None, garmin_source=None):
     elapsed = int(activity.get("elapsed_time", 0) or 0)
     if lyfta_workout and lyfta_workout.get("duration"):
         elapsed = lyfta_workout["duration"]
+    if elapsed <= 0 and lyfta_workout and lyfta_workout.get("sets"):
+        elapsed = planned_sets_duration_seconds(lyfta_workout["sets"])
     end_fit = start_fit + elapsed
     duration_ms = elapsed * 1000
 
@@ -618,6 +634,54 @@ def extract_garmin_hr_source(garmin, source_activity, max_step_seconds=5):
     return result
 
 
+def get_garmin_profile_weight_kg(garmin):
+    try:
+        profile = garmin.get_user_profile()
+    except Exception:
+        return None
+    user_data = profile.get("userData", {}) if isinstance(profile, dict) else {}
+    weight = user_data.get("weight")
+    if weight is None:
+        return None
+    try:
+        weight = float(weight)
+    except (TypeError, ValueError):
+        return None
+    if weight > 300:
+        weight = weight / 1000
+    return weight if weight > 0 else None
+
+
+def resolve_weight_kg(values, garmin):
+    configured = str(values.get("USER_WEIGHT_KG", "")).strip()
+    if configured:
+        try:
+            weight = float(configured.replace(",", "."))
+            if weight > 0:
+                return weight, "config"
+        except ValueError:
+            pass
+
+    profile_weight = get_garmin_profile_weight_kg(garmin)
+    if profile_weight:
+        return profile_weight, "Garmin profile"
+    return 85.0, "default"
+
+
+def estimate_strength_calories(activity, lyfta_workout, weight_kg, strength_met):
+    elapsed = int(activity.get("elapsed_time", 0) or 0)
+    if lyfta_workout and lyfta_workout.get("duration"):
+        elapsed = lyfta_workout["duration"]
+    if elapsed <= 0 and lyfta_workout and lyfta_workout.get("sets"):
+        elapsed = planned_sets_duration_seconds(lyfta_workout["sets"])
+    if elapsed <= 0:
+        elapsed = 45 * 60
+
+    minutes = elapsed / 60
+    calories = strength_met * 3.5 * weight_kg * minutes / 200
+    return max(1, int(round(calories)))
+
+
 def garmin_activity_in_range(activity, start_time, end_time):
     garmin_time = parse_garmin_local_time(activity)
     if garmin_time is None:
@@ -650,6 +714,20 @@ def validate_values(values, require_garmin=True):
         raise ValueError("Days Back must be a number.")
     if days_back < 1:
         raise ValueError("Days Back must be at least 1.")
+    try:
+        strength_met = float(str(values.get("STRENGTH_MET", "5.0")).replace(",", "."))
+    except ValueError:
+        raise ValueError("Strength MET must be a number.")
+    if strength_met <= 0:
+        raise ValueError("Strength MET must be greater than 0.")
+    weight = str(values.get("USER_WEIGHT_KG", "")).strip()
+    if weight:
+        try:
+            user_weight = float(weight.replace(",", "."))
+        except ValueError:
+            raise ValueError("User Weight KG must be a number or empty.")
+        if user_weight <= 0:
+            raise ValueError("User Weight KG must be greater than 0 or empty.")
     if require_garmin and (not values.get("GARMIN_EMAIL") or not values.get("GARMIN_PASSWORD")):
         raise ValueError("Garmin email and password are required.")
 
@@ -759,8 +837,10 @@ def run_sync(values, log, ask_strava_code=None, ask_garmin_mfa=None, open_browse
     values.setdefault("STRAVA_CALLBACK_URL", "http://localhost")
     values.setdefault("LYFTA_CSV", "WorkoutData.csv")
     values.setdefault("DAYS_BACK", "30")
+    values.setdefault("STRENGTH_MET", "5.0")
 
     days_back = int(values["DAYS_BACK"])
+    strength_met = float(str(values["STRENGTH_MET"]).replace(",", "."))
     token = get_strava_token(values, log, ask_code=ask_strava_code, open_browser=open_browser)
 
     log("Fetching Strava strength workouts from the last {} days...".format(days_back))
@@ -783,6 +863,8 @@ def run_sync(values, log, ask_strava_code=None, ask_garmin_mfa=None, open_browse
     GARMIN_TOKENS_DIR.mkdir(exist_ok=True)
     garmin.login(tokenstore=str(GARMIN_TOKENS_DIR))
     log("Logged in to Garmin Connect.")
+    weight_kg, weight_source = resolve_weight_kg(values, garmin)
+    log("Using {:.1f} kg from {} for estimated calories when Garmin calories are unavailable.".format(weight_kg, weight_source))
 
     synced = set(load_json(SYNCED_IDS_FILE, []))
     garmin_activities = fetch_garmin_strength_activities(garmin)
@@ -854,6 +936,20 @@ def run_sync(values, log, ask_strava_code=None, ask_garmin_mfa=None, open_browse
                     source_id,
                     garmin_source.get("calories", 0),
                     len(garmin_source.get("hr_offsets", [])),
+                ))
+            else:
+                estimated_calories = estimate_strength_calories(workout, lyfta_match, weight_kg, strength_met)
+                garmin_source = {
+                    "activity_id": None,
+                    "calories": estimated_calories,
+                    "hr_offsets": [],
+                    "calories_source": "estimated",
+                }
+                log("EST   [{}] estimated {} kcal using {:.1f} kg and {:.1f} MET.".format(
+                    date,
+                    estimated_calories,
+                    weight_kg,
+                    strength_met,
                 ))
             if lyfta_match:
                 fit_bytes = build_fit(workout, lyfta_match, garmin_source)
@@ -927,6 +1023,8 @@ class App:
         self.callback_url = StringVar(value=env.get("STRAVA_CALLBACK_URL", "http://localhost"))
         self.lyfta_csv = StringVar(value=env.get("LYFTA_CSV", "WorkoutData.csv"))
         self.days_back = StringVar(value=env.get("DAYS_BACK", "30"))
+        self.user_weight_kg = StringVar(value=env.get("USER_WEIGHT_KG", ""))
+        self.strength_met = StringVar(value=env.get("STRENGTH_MET", "5.0"))
         self.daily_sync_time = StringVar(value=env.get("DAILY_SYNC_TIME", "08:00"))
         self.status = StringVar(value="Ready")
 
@@ -948,10 +1046,12 @@ class App:
         self.add_field(outer, 5, "Callback URL", self.callback_url)
         self.add_field(outer, 6, "Lyfta CSV", self.lyfta_csv)
         self.add_field(outer, 7, "Days Back", self.days_back, width=12)
-        self.add_field(outer, 8, "Daily Sync Time", self.daily_sync_time, width=12)
+        self.add_field(outer, 8, "User Weight KG", self.user_weight_kg, width=12)
+        self.add_field(outer, 9, "Strength MET", self.strength_met, width=12)
+        self.add_field(outer, 10, "Daily Sync Time", self.daily_sync_time, width=12)
 
         buttons = Frame(outer)
-        buttons.grid(row=9, column=0, columnspan=3, sticky=W, pady=(12, 8))
+        buttons.grid(row=11, column=0, columnspan=3, sticky=W, pady=(12, 8))
         self.save_button = Button(buttons, text="Save Config", width=16, command=self.save_config)
         self.save_button.pack(side="left", padx=(0, 8))
         self.run_button = Button(buttons, text="Run Sync", width=16, command=self.start_sync)
@@ -966,7 +1066,7 @@ class App:
         self.resync_button.pack(side="left")
 
         service_buttons = Frame(outer)
-        service_buttons.grid(row=10, column=0, columnspan=3, sticky=W, pady=(0, 12))
+        service_buttons.grid(row=12, column=0, columnspan=3, sticky=W, pady=(0, 12))
         self.install_task_button = Button(service_buttons, text="Install Daily Sync", width=18, command=self.install_daily_sync)
         self.install_task_button.pack(side="left", padx=(0, 8))
         self.uninstall_task_button = Button(service_buttons, text="Remove Daily Sync", width=18, command=self.uninstall_daily_sync)
@@ -978,13 +1078,13 @@ class App:
         self.open_log_button = Button(service_buttons, text="Open Log", width=12, command=self.open_daily_log)
         self.open_log_button.pack(side="left")
 
-        Label(outer, textvariable=self.status, anchor="w").grid(row=11, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        Label(outer, textvariable=self.status, anchor="w").grid(row=13, column=0, columnspan=3, sticky="ew", pady=(0, 6))
 
         self.log = ScrolledText(outer, height=18, wrap="word", state=DISABLED)
-        self.log.grid(row=12, column=0, columnspan=3, sticky="nsew")
+        self.log.grid(row=14, column=0, columnspan=3, sticky="nsew")
 
         outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(12, weight=1)
+        outer.rowconfigure(14, weight=1)
 
     def add_field(self, parent, row, label, variable, show=None, width=48):
         Label(parent, text=label).grid(row=row, column=0, sticky=W, pady=4, padx=(0, 10))
@@ -1001,6 +1101,8 @@ class App:
             "STRAVA_CALLBACK_URL": self.callback_url.get().strip() or "http://localhost",
             "LYFTA_CSV": self.lyfta_csv.get().strip() or "WorkoutData.csv",
             "DAYS_BACK": self.days_back.get().strip() or "30",
+            "USER_WEIGHT_KG": self.user_weight_kg.get().strip(),
+            "STRENGTH_MET": self.strength_met.get().strip() or "5.0",
             "DAILY_SYNC_TIME": self.daily_sync_time.get().strip() or "08:00",
         }
 

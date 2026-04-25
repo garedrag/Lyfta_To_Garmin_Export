@@ -7,7 +7,7 @@ This transfers Lyfta gym workouts to Garmin Connect through Strava:
 3. The script creates a minimal FIT activity file.
 4. The script uploads that FIT file to Garmin Connect.
 
-When `WorkoutData.csv` is present and a match is found, Garmin will show activity type, start time, duration, calories, and individual sets with reps and weight. Without a CSV match, Garmin shows activity type, start time, duration, and calories only — individual sets are not available from Strava alone.
+When `WorkoutData.csv` is present and a match is found, Garmin will show activity type, start time, duration, calories, and individual sets with reps and weight. If an original Garmin strength activity exists near the same time, the app copies calories and heart-rate samples from it. Otherwise it estimates strength-training calories from duration, body weight, and `STRENGTH_MET`.
 
 ## Setup
 
@@ -24,6 +24,13 @@ The GUI lets you save config, reset Strava login, and run the sync. On first run
 The one-file GUI app is `lyfta_garmin_app.py`. It contains the GUI, Strava sync, FIT builder, and Garmin upload logic in one file. You can still use `run_lyfta_to_garmin.bat` for the older terminal version.
 
 If `WorkoutData.csv` is present, the GUI matches Lyfta CSV workouts to Strava workouts by start time and writes reps/weight as FIT set messages. If no CSV match is found, it uploads a summary-only strength activity.
+
+Calorie fallback:
+
+- `USER_WEIGHT_KG` can be set manually in `.env` or the GUI.
+- If blank, the app uses Garmin profile weight when available.
+- If Garmin profile weight is unavailable, it uses `85 kg`.
+- `STRENGTH_MET` defaults to `5.0`, a moderate/vigorous strength-training estimate.
 
 For existing Garmin activities that were already uploaded without exercise details, delete those empty Garmin activities first, then use `Reset Synced IDs` in the GUI and run sync again. Garmin may reject duplicate uploads if the old activities are still present.
 
