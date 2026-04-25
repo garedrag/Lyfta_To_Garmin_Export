@@ -1,0 +1,8 @@
+.env
+strava_tokens.json
+synced_ids.json
+WorkoutData.csv
+garmin_tokens/
+logs/
+__pycache__/
+*.pyc
