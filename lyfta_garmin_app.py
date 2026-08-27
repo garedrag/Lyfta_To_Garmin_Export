@@ -15,6 +15,7 @@ import traceback
 import webbrowser
 import io
 import zipfile
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import BOTH, DISABLED, END, NORMAL, W
@@ -37,6 +38,7 @@ ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 STRAVA_TOKENS_FILE = ROOT / "strava_tokens.json"
 SYNCED_IDS_FILE = ROOT / "synced_ids.json"
+DIRECT_SYNCED_IDS_FILE = ROOT / "direct_synced_ids.json"
 GARMIN_TOKENS_DIR = ROOT / "garmin_tokens"
 LOG_DIR = ROOT / "logs"
 DAILY_LOG_FILE = LOG_DIR / "daily-sync.log"
@@ -85,6 +87,7 @@ def write_env_file(values):
         "DAYS_BACK={}".format(values.get("DAYS_BACK", "30")),
         "USER_WEIGHT_KG={}".format(values.get("USER_WEIGHT_KG", "")),
         "STRENGTH_MET={}".format(values.get("STRENGTH_MET", "5.0")),
+        "SYNC_MODE={}".format(values.get("SYNC_MODE", "direct")),
         "DAILY_SYNC_TIME={}".format(values.get("DAILY_SYNC_TIME", "08:00")),
         "",
     ]))
@@ -313,6 +316,26 @@ def load_lyfta_workouts(csv_path):
     return sorted(grouped.values(), key=lambda item: item["started_at"])
 
 
+def build_direct_workouts(lyfta_workouts):
+    """Convert Lyfta CSV workouts into the small activity shape used for FIT export."""
+    local_tz = datetime.now().astimezone().tzinfo
+    activities = []
+    for workout in lyfta_workouts:
+        started_at = workout["started_at"]
+        utc_started_at = started_at.replace(tzinfo=local_tz).astimezone(timezone.utc)
+        identity = "{}|{}|{}".format(
+            started_at.isoformat(), workout.get("title", ""), workout.get("duration", 0),
+        )
+        activities.append({
+            "id": "lyfta:" + hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+            "name": workout.get("title") or "Strength Training",
+            "start_date": utc_started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "elapsed_time": int(workout.get("duration", 0) or 0),
+            "sport_type": "WeightTraining",
+        })
+    return activities
+
+
 def match_lyfta_workout(activity, lyfta_workouts):
     candidates = []
     for key in ("start_date_local", "start_date"):
@@ -342,7 +365,7 @@ def match_lyfta_workout(activity, lyfta_workouts):
     return None
 
 
-def build_fit(activity, lyfta_workout=None, garmin_source=None):
+def build_fit(activity, lyfta_workout=None, garmin_source=None, strength_met=5.0):
     start_dt = datetime.strptime(activity["start_date"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     start_fit = int(start_dt.timestamp()) - FIT_EPOCH
     elapsed = int(activity.get("elapsed_time", 0) or 0)
@@ -358,9 +381,10 @@ def build_fit(activity, lyfta_workout=None, garmin_source=None):
     calories = int(activity.get("calories", 0) or 0)
     if garmin_source and garmin_source.get("calories"):
         calories = int(garmin_source["calories"])
+    avg_hr, max_hr = summarize_hr(garmin_source, strength_met)
 
     has_sets = bool(lyfta_workout and lyfta_workout.get("sets"))
-    has_hr = bool(garmin_source and garmin_source.get("hr_offsets"))
+    has_hr = bool(garmin_source)
 
     # local 0 = file_id (global 0)
     # local 1 = event   (global 21)
@@ -376,6 +400,7 @@ def build_fit(activity, lyfta_workout=None, garmin_source=None):
         def_msg(2, 18, [
             (253, 4, UINT32), (2, 4, UINT32), (5, 1, ENUM), (6, 1, ENUM),
             (7, 4, UINT32), (8, 4, UINT32), (11, 2, UINT16), (28, 1, ENUM),
+            (16, 1, UINT8), (17, 1, UINT8),
             (1, 2, UINT16),  # num_laps
         ]),
         def_msg(3, 34, [
@@ -384,7 +409,7 @@ def build_fit(activity, lyfta_workout=None, garmin_source=None):
         ]),
         def_msg(4, 19, [
             (253, 4, UINT32), (2, 4, UINT32), (7, 4, UINT32), (8, 4, UINT32),
-            (5, 1, ENUM), (6, 1, ENUM), (0, 2, UINT16),
+            (5, 1, ENUM), (6, 1, ENUM), (11, 2, UINT16), (15, 1, UINT8), (16, 1, UINT8), (0, 2, UINT16),
         ]),
     ]
 
@@ -464,23 +489,30 @@ def build_fit(activity, lyfta_workout=None, garmin_source=None):
         *set_records,
     ]
 
-    if has_hr:
+    if garmin_source and garmin_source.get("hr_offsets"):
         for offset, heart_rate in garmin_source["hr_offsets"]:
             if 0 <= offset <= elapsed:
                 data_records.append(data_msg(7,
                     ("<I", start_fit + offset),
                     ("<B", max(0, min(255, int(heart_rate)))),
                 ))
+    elif has_hr and elapsed > 0:
+        for offset in range(0, elapsed + 1, 60):
+            data_records.append(data_msg(7,
+                ("<I", start_fit + offset),
+                ("<B", max(0, min(255, int(avg_hr)))),
+            ))
 
     data_records += [
         data_msg(4,
             ("<I", end_fit), ("<I", start_fit),
             ("<I", duration_ms), ("<I", duration_ms),
-            ("<B", SPORT_TRAINING), ("<B", sub_sport), ("<H", 0),
+            ("<B", SPORT_TRAINING), ("<B", sub_sport), ("<H", calories), ("<B", avg_hr), ("<B", max_hr), ("<H", 0),
         ),
         data_msg(2,
             ("<I", end_fit), ("<I", start_fit), ("<B", SPORT_TRAINING), ("<B", sub_sport),
             ("<I", duration_ms), ("<I", duration_ms), ("<H", calories), ("<B", 0),
+            ("<B", avg_hr), ("<B", max_hr),
             ("<H", 1),
         ),
         data_msg(3, ("<I", end_fit), ("<I", duration_ms), ("<H", 1), ("<B", 0), ("<B", 26), ("<B", 1)),
@@ -682,6 +714,21 @@ def estimate_strength_calories(activity, lyfta_workout, weight_kg, strength_met)
     return max(1, int(round(calories)))
 
 
+def estimate_strength_hr(strength_met):
+    avg_hr = int(round(90 + strength_met * 6))
+    avg_hr = max(95, min(145, avg_hr))
+    max_hr = max(avg_hr + 10, min(175, avg_hr + 25))
+    return avg_hr, max_hr
+
+
+def summarize_hr(garmin_source, strength_met):
+    hr_offsets = (garmin_source or {}).get("hr_offsets") or []
+    values = [int(heart_rate) for _, heart_rate in hr_offsets if heart_rate]
+    if values:
+        return int(round(sum(values) / len(values))), max(values)
+    return estimate_strength_hr(strength_met)
+
+
 def garmin_activity_in_range(activity, start_time, end_time):
     garmin_time = parse_garmin_local_time(activity)
     if garmin_time is None:
@@ -730,6 +777,16 @@ def validate_values(values, require_garmin=True):
             raise ValueError("User Weight KG must be greater than 0 or empty.")
     if require_garmin and (not values.get("GARMIN_EMAIL") or not values.get("GARMIN_PASSWORD")):
         raise ValueError("Garmin email and password are required.")
+
+
+def validate_direct_values(values):
+    if not values.get("GARMIN_EMAIL") or not values.get("GARMIN_PASSWORD"):
+        raise ValueError("Garmin email and password are required.")
+    csv_path = Path(values.get("LYFTA_CSV") or "WorkoutData.csv")
+    if not csv_path.is_absolute():
+        csv_path = ROOT / csv_path
+    if not csv_path.exists():
+        raise ValueError("Lyfta CSV was not found: {}".format(csv_path))
 
 
 def validate_daily_time(value):
@@ -952,11 +1009,11 @@ def run_sync(values, log, ask_strava_code=None, ask_garmin_mfa=None, open_browse
                     strength_met,
                 ))
             if lyfta_match:
-                fit_bytes = build_fit(workout, lyfta_match, garmin_source)
+                fit_bytes = build_fit(workout, lyfta_match, garmin_source, strength_met)
                 exercise_count = len(unique_exercises(lyfta_match["sets"])[0])
                 log("SETS  [{}] matched {} exercises and {} sets from Lyfta CSV with names, reps, and weight.".format(date, exercise_count, len(lyfta_match["sets"])))
             else:
-                fit_bytes = build_fit(workout, garmin_source=garmin_source)
+                fit_bytes = build_fit(workout, garmin_source=garmin_source, strength_met=strength_met)
                 log("SETS  [{}] no Lyfta CSV match; uploading summary only.".format(date))
             upload_to_garmin(garmin, fit_bytes)
             synced.add(wid)
@@ -968,6 +1025,84 @@ def run_sync(values, log, ask_strava_code=None, ask_garmin_mfa=None, open_browse
             failed += 1
             log("FAIL  [{}] {}: {}".format(date, name, exc))
 
+        time.sleep(1.5)
+    log("Done. Uploaded {}, skipped {}, failed {}.".format(uploaded, skipped, failed))
+    return {"uploaded": uploaded, "failed": failed, "skipped": skipped}
+
+
+def run_direct_sync(values, log, ask_garmin_mfa=None, dry_run=False, resync_existing=False):
+    """Upload Lyfta CSV workouts directly to Garmin without using Strava."""
+    validate_direct_values(values)
+    lyfta_workouts = load_lyfta_workouts(values.get("LYFTA_CSV") or "WorkoutData.csv")
+    workouts = build_direct_workouts(lyfta_workouts)
+    log("Loaded {} Lyfta CSV workouts for direct Garmin sync.".format(len(workouts)))
+    if not workouts:
+        log("Nothing to sync. The Lyfta CSV has no workouts.")
+        return {"uploaded": 0, "failed": 0, "skipped": 0}
+
+    log("Logging in to Garmin Connect...")
+    garmin = Garmin(values["GARMIN_EMAIL"], values["GARMIN_PASSWORD"], prompt_mfa=ask_garmin_mfa)
+    GARMIN_TOKENS_DIR.mkdir(exist_ok=True)
+    garmin.login(tokenstore=str(GARMIN_TOKENS_DIR))
+    log("Logged in to Garmin Connect.")
+    weight_kg, weight_source = resolve_weight_kg(values, garmin)
+    strength_met = float(str(values.get("STRENGTH_MET", "5.0")).replace(",", "."))
+    synced = set(load_json(DIRECT_SYNCED_IDS_FILE, []))
+
+    if resync_existing:
+        log("Direct resync mode: looking for old app-uploaded Garmin strength activities to replace.")
+        starts = [parse_strava_local_time(activity) for activity in workouts]
+        starts = [value for value in starts if value is not None]
+        if starts:
+            start_range = min(starts).replace(hour=0, minute=0, second=0)
+            end_range = max(starts).replace(hour=23, minute=59, second=59)
+            garmin_activities = fetch_garmin_strength_activities(garmin, limit=1000)
+            replaceable = [
+                activity for activity in garmin_activities
+                if is_replaceable_uploaded_activity(activity)
+                and garmin_activity_in_range(activity, start_range, end_range)
+            ]
+            replaceable = sorted(replaceable, key=lambda activity: activity.get("startTimeLocal") or "")
+            for activity in replaceable:
+                activity_id = str(activity["activityId"])
+                activity_time = activity.get("startTimeLocal", "")
+                if dry_run:
+                    log("DRY RUN would delete Garmin activity {} [{}]".format(activity_id, activity_time))
+                else:
+                    log("RESYNC deleting Garmin activity {} [{}]".format(activity_id, activity_time))
+                    garmin.delete_activity(activity_id)
+                    time.sleep(0.5)
+            if dry_run:
+                log("Dry run complete. Would delete {} old app-uploaded Garmin activities.".format(len(replaceable)))
+                return {"uploaded": 0, "failed": 0, "skipped": 0}
+            synced.clear()
+            save_json(DIRECT_SYNCED_IDS_FILE, [])
+            log("Direct resync mode: deleted {} old Garmin activities and cleared direct synced IDs.".format(len(replaceable)))
+
+    uploaded = failed = skipped = 0
+
+    for activity, lyfta_workout in zip(workouts, lyfta_workouts):
+        workout_id = activity["id"]
+        if workout_id in synced:
+            skipped += 1
+            log("SKIP  [{}] {}".format(activity["start_date"][:10], activity["name"]))
+            continue
+        try:
+            calories = estimate_strength_calories(activity, lyfta_workout, weight_kg, strength_met)
+            fit_bytes = build_fit(activity, lyfta_workout, {"calories": calories, "hr_offsets": []}, strength_met)
+            if dry_run:
+                log("DRY RUN [{}] {} — would upload {} sets.".format(
+                    activity["start_date"][:10], activity["name"], len(lyfta_workout.get("sets", [])),
+                ))
+                continue
+            upload_to_garmin(garmin, fit_bytes)
+            synced.add(workout_id)
+            save_json(DIRECT_SYNCED_IDS_FILE, sorted(synced))
+            uploaded += 1
+            log("OK    [{}] {}".format(activity["start_date"][:10], activity["name"]))
+        except Exception as exc:
+            failed += 1
+            log("FAIL  [{}] {}: {}".format(activity["start_date"][:10], activity["name"], exc))
         time.sleep(1.5)
     log("Done. Uploaded {}, skipped {}, failed {}.".format(uploaded, skipped, failed))
     return {"uploaded": uploaded, "failed": failed, "skipped": skipped}
@@ -988,15 +1123,26 @@ def run_headless_sync():
 
     log("Starting scheduled Lyfta to Garmin sync.")
     try:
-        run_sync(
-            values,
-            log,
-            ask_strava_code=None,
-            ask_garmin_mfa=None,
-            open_browser=False,
-            resync_existing="--resync" in sys.argv,
-            dry_run="--dry-run" in sys.argv,
-        )
+        sync_mode = str(values.get("SYNC_MODE", "direct")).strip().lower()
+        use_direct = "--direct" in sys.argv or (sync_mode == "direct" and "--strava" not in sys.argv)
+        if use_direct:
+            run_direct_sync(
+                values,
+                log,
+                ask_garmin_mfa=None,
+                dry_run="--dry-run" in sys.argv,
+                resync_existing="--resync" in sys.argv,
+            )
+        else:
+            run_sync(
+                values,
+                log,
+                ask_strava_code=None,
+                ask_garmin_mfa=None,
+                open_browser=False,
+                resync_existing="--resync" in sys.argv,
+                dry_run="--dry-run" in sys.argv,
+            )
     except Exception:
         log("ERROR:\n{}".format(traceback.format_exc()))
         return 1
@@ -1056,6 +1202,8 @@ class App:
         self.save_button.pack(side="left", padx=(0, 8))
         self.run_button = Button(buttons, text="Run Sync", width=16, command=self.start_sync)
         self.run_button.pack(side="left", padx=(0, 8))
+        self.direct_sync_button = Button(buttons, text="Direct Lyfta → Garmin", width=20, command=self.start_direct_sync)
+        self.direct_sync_button.pack(side="left", padx=(0, 8))
         self.reset_strava_button = Button(buttons, text="Reset Strava Login", width=18, command=self.reset_strava_login)
         self.reset_strava_button.pack(side="left", padx=(0, 8))
         self.reset_garmin_button = Button(buttons, text="Reset Garmin Login", width=18, command=self.reset_garmin_login)
@@ -1161,6 +1309,16 @@ class App:
         self.worker = threading.Thread(target=self.run_sync, daemon=True)
         self.worker.start()
 
+    def start_direct_sync(self):
+        try:
+            validate_direct_values(self.config())
+        except ValueError as exc:
+            messagebox.showerror("Invalid Config", str(exc))
+            return
+        self.set_running(True)
+        self.worker = threading.Thread(target=self.run_direct_sync, daemon=True)
+        self.worker.start()
+
     def start_resync(self):
         try:
             self.validate_config(require_garmin=True)
@@ -1182,6 +1340,7 @@ class App:
         state = DISABLED if running else NORMAL
         for button in (
             self.run_button,
+            self.direct_sync_button,
             self.save_button,
             self.reset_strava_button,
             self.reset_garmin_button,
@@ -1277,6 +1436,22 @@ class App:
         finally:
             self.root.after(0, lambda: self.set_running(False))
 
+    def run_direct_sync(self):
+        try:
+            run_direct_sync(
+                self.config(),
+                self.log_line,
+                ask_garmin_mfa=lambda: self.ask_text(
+                    "Garmin 2FA",
+                    "Enter the Garmin 2FA code from your email/app:",
+                ) or "",
+            )
+        except Exception as exc:
+            self.log_line("ERROR: {}".format(exc))
+            self.log_line(traceback.format_exc())
+        finally:
+            self.root.after(0, lambda: self.set_running(False))
+
     def ask_text(self, title, prompt):
         result = {"value": None}
         done = threading.Event()
@@ -1311,7 +1486,7 @@ class App:
 
 
 def main():
-    if len(sys.argv) > 1 and any(arg in ("--sync", "sync", "--headless", "--resync") for arg in sys.argv[1:]):
+    if len(sys.argv) > 1 and any(arg in ("--sync", "sync", "--headless", "--resync", "--direct") for arg in sys.argv[1:]):
         sys.exit(run_headless_sync())
     root = Tk()
     App(root)

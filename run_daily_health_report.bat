@@ -3,7 +3,7 @@ setlocal
 
 cd /d "%~dp0"
 
-set "PYTHON_EXE=C:\Program Files\PyManager\python.exe"
+set "PYTHON_EXE=C:\Program Files\Python311\python.exe"
 
 if not exist "%PYTHON_EXE%" (
     echo Python was not found at "%PYTHON_EXE%".
@@ -11,4 +11,4 @@ if not exist "%PYTHON_EXE%" (
     exit /b 1
 )
 
-"%PYTHON_EXE%" "%~dp0lyfta_garmin_app.py" --direct
+"%PYTHON_EXE%" "%~dp0garmin_health_reporter.py"
