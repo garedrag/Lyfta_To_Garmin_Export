@@ -23,6 +23,11 @@ from tkinter import Button, Entry, Frame, Label, StringVar, Tk, messagebox, simp
 from tkinter.scrolledtext import ScrolledText
 from urllib.parse import urlencode
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
 if sys.version_info < (3, 8):
     sys.exit("Python 3.8 or newer is required.")
 
@@ -46,6 +51,7 @@ TASK_NAME = "LyftaToGarminDailySync"
 RUN_DAILY_SYNC_BAT = ROOT / "run_daily_sync.bat"
 
 LYFTA_API_BASE = "https://my.lyfta.app"
+LYFTA_API_TIMEZONE = "Europe/Berlin"
 
 STRENGTH_TYPES = {"WeightTraining", "Workout", "Crossfit", "Pilates", "Yoga"}
 
@@ -202,6 +208,31 @@ def format_duration(seconds):
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours}:{minutes}:{secs}"
+
+
+def local_workout_timezone():
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(os.environ.get("LYFTA_API_TIMEZONE", LYFTA_API_TIMEZONE))
+        except Exception:
+            pass
+    return datetime.now().astimezone().tzinfo
+
+
+def parse_lyfta_api_datetime(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z") or "+" in text[10:]:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        else:
+            parsed = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(local_workout_timezone()).replace(tzinfo=None)
 
 
 def parse_float(value):
@@ -400,17 +431,9 @@ def fetch_lyfta_workouts_from_api(api_key, days_back=30):
         saw_older_than_window = False
         for workout in batch:
             perform_date = workout.get("workout_perform_date", "")
-            if not perform_date:
+            started_at = parse_lyfta_api_datetime(perform_date)
+            if started_at is None:
                 continue
-
-            try:
-                started_at = datetime.strptime(perform_date[:19], "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                try:
-                    started_at = datetime.fromisoformat(perform_date.replace("Z", "+00:00"))
-                    started_at = started_at.replace(tzinfo=None)
-                except ValueError:
-                    continue
 
             if started_at < after_datetime:
                 saw_older_than_window = True
@@ -500,12 +523,11 @@ def update_lyfta_csv_from_api(csv_path, api_key, days_back=30, log=None):
                     row = {key.strip(): value for key, value in raw.items()}
                     existing_rows.append(row)
 
-    existing_keys = set()
+    existing_dates = set()
     for row in existing_rows:
         date_text = row.get("Date", "").strip()
-        title = row.get("Title", "").strip()
-        if date_text and title:
-            existing_keys.add((title, date_text))
+        if date_text:
+            existing_dates.add(date_text)
 
     new_rows = []
     added_workout_keys = set()
@@ -515,10 +537,9 @@ def update_lyfta_csv_from_api(csv_path, api_key, days_back=30, log=None):
         title = workout["title"]
         duration = format_duration(workout.get("duration", 0))
 
-        key = (title, date_str)
-        if key in existing_keys:
+        if date_str in existing_dates:
             continue
-        added_workout_keys.add(key)
+        added_workout_keys.add(date_str)
 
         for set_info in workout["sets"]:
             new_rows.append({
@@ -984,6 +1005,15 @@ def garmin_activity_in_range(activity, start_time, end_time):
     return start_time <= garmin_time <= end_time
 
 
+def find_existing_uploaded_activity(garmin_activities, started_at, tolerance_seconds=10800):
+    start_time = started_at - timedelta(seconds=tolerance_seconds)
+    end_time = started_at + timedelta(seconds=tolerance_seconds)
+    for activity in garmin_activities:
+        if is_replaceable_uploaded_activity(activity) and garmin_activity_in_range(activity, start_time, end_time):
+            return activity
+    return None
+
+
 def upload_to_garmin(garmin, fit_bytes):
     with tempfile.NamedTemporaryFile(suffix=".fit", delete=False, prefix="lyfta_") as handle:
         handle.write(fit_bytes)
@@ -1303,6 +1333,12 @@ def run_direct_sync(values, log, ask_garmin_mfa=None, dry_run=False, resync_exis
     weight_kg, weight_source = resolve_weight_kg(values, garmin)
     strength_met = float(str(values.get("STRENGTH_MET", "5.0")).replace(",", "."))
     synced = set(load_json(DIRECT_SYNCED_IDS_FILE, []))
+    existing_uploads = []
+
+    if not resync_existing:
+        existing_uploads = fetch_garmin_strength_activities(garmin, limit=1000)
+        existing_uploads = [activity for activity in existing_uploads if is_replaceable_uploaded_activity(activity)]
+        log("Loaded {} existing app-uploaded Garmin strength activities for duplicate checks.".format(len(existing_uploads)))
 
     if resync_existing:
         log("Direct resync mode: looking for old app-uploaded Garmin strength activities to replace.")
@@ -1341,6 +1377,17 @@ def run_direct_sync(values, log, ask_garmin_mfa=None, dry_run=False, resync_exis
         if workout_id in synced:
             skipped += 1
             log("SKIP  [{}] {}".format(activity["start_date"][:10], activity["name"]))
+            continue
+        existing_activity = find_existing_uploaded_activity(existing_uploads, lyfta_workout["started_at"])
+        if existing_activity:
+            skipped += 1
+            existing_id = str(existing_activity.get("activityId", ""))
+            if not dry_run:
+                synced.add(workout_id)
+                save_json(DIRECT_SYNCED_IDS_FILE, sorted(synced))
+            log("SKIP  [{}] {} already exists in Garmin ({})".format(
+                activity["start_date"][:10], activity["name"], existing_id,
+            ))
             continue
         try:
             calories = estimate_strength_calories(activity, lyfta_workout, weight_kg, strength_met)
