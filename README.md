@@ -1,4 +1,68 @@
-# Garmin Data Export and Daily Health Report
+# Lyfta to Garmin Export
+
+This project syncs strength workouts from Lyfta to Garmin Connect. The preferred workflow is direct Lyfta API sync, without WhatsApp exports or manual CSV copying.
+
+Main flow:
+
+1. Fetch workouts from Lyfta API.
+2. Update the local cache file `WorkoutData.csv`.
+3. Build Garmin FIT strength activities with exercise names, sets, reps, weight, estimated calories, and estimated HR.
+4. Upload only unsynced workouts to Garmin Connect.
+5. Run the same sync once per day through Windows Task Scheduler.
+
+## Lyfta API Setup
+
+Generate a Lyfta API key at:
+
+```text
+https://my.lyfta.app/community/api
+```
+
+Add it to `.env`:
+
+```env
+LYFTA_API_KEY=your_lyfta_api_key
+LYFTA_API_DAYS_BACK=3650
+LYFTA_CSV=WorkoutData.csv
+SYNC_MODE=direct
+```
+
+`WorkoutData.csv` is now a local cache. When `LYFTA_API_KEY` is set, the app updates this file automatically before every manual or scheduled sync. If `LYFTA_API_KEY` is empty, the app falls back to the existing CSV file only.
+
+## Run The Sync
+
+Open the GUI:
+
+```bat
+run_gui.bat
+```
+
+Use:
+
+- `Direct Lyfta -> Garmin` to run a normal sync.
+- `Resync Old` to delete matching app-uploaded Garmin strength activities and upload them again.
+- `Install Daily Sync` to schedule one sync per day.
+- `Run Daily Sync Now` to test the scheduled/headless path.
+
+Headless direct sync:
+
+```bat
+lyfta_garmin_app.py --direct
+```
+
+Headless direct resync:
+
+```bat
+lyfta_garmin_app.py --direct --resync
+```
+
+Logs are written to:
+
+```text
+logs/daily-sync.log
+```
+
+## Garmin Data Export and Daily Health Report
 
 This project is a local-first app for collecting, exporting, and formatting as much Garmin data as practical from your Garmin Connect account.
 

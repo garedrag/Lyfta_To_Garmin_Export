@@ -16,7 +16,7 @@ import webbrowser
 import io
 import zipfile
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import BOTH, DISABLED, END, NORMAL, W
 from tkinter import Button, Entry, Frame, Label, StringVar, Tk, messagebox, simpledialog
@@ -45,7 +45,12 @@ DAILY_LOG_FILE = LOG_DIR / "daily-sync.log"
 TASK_NAME = "LyftaToGarminDailySync"
 RUN_DAILY_SYNC_BAT = ROOT / "run_daily_sync.bat"
 
+LYFTA_API_BASE = "https://my.lyfta.app"
+
 STRENGTH_TYPES = {"WeightTraining", "Workout", "Crossfit", "Pilates", "Yoga"}
+
+# CSV columns expected by load_lyfta_workouts
+LYFTA_CSV_COLUMNS = ["Date", "Title", "Duration", "Exercise", "Reps", "Weight", "Set Type"]
 FIT_EPOCH = 631065600
 
 ENUM = 0x00
@@ -84,6 +89,8 @@ def write_env_file(values):
         "",
         "STRAVA_CALLBACK_URL={}".format(values.get("STRAVA_CALLBACK_URL", "http://localhost")),
         "LYFTA_CSV={}".format(values.get("LYFTA_CSV", "WorkoutData.csv")),
+        "LYFTA_API_KEY={}".format(values.get("LYFTA_API_KEY", "")),
+        "LYFTA_API_DAYS_BACK={}".format(values.get("LYFTA_API_DAYS_BACK", "3650")),
         "DAYS_BACK={}".format(values.get("DAYS_BACK", "30")),
         "USER_WEIGHT_KG={}".format(values.get("USER_WEIGHT_KG", "")),
         "STRENGTH_MET={}".format(values.get("STRENGTH_MET", "5.0")),
@@ -101,6 +108,43 @@ def load_json(path, default):
 
 def save_json(path, value):
     path.write_text(json.dumps(value, indent=2))
+
+
+def resolve_csv_path(csv_path):
+    path = Path(csv_path or "WorkoutData.csv")
+    return path if path.is_absolute() else ROOT / path
+
+
+def lyfta_csv_stats(path):
+    try:
+        with Path(path).open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames:
+                return None
+            headers = {name.strip() for name in reader.fieldnames}
+            if not all(name in headers for name in LYFTA_CSV_COLUMNS):
+                return None
+            workout_keys = set()
+            last_date = None
+            row_count = 0
+            for raw in reader:
+                row = {key.strip(): value for key, value in raw.items()}
+                date_text = row.get("Date", "").strip()
+                title = row.get("Title", "").strip()
+                duration = row.get("Duration", "").strip()
+                if not date_text:
+                    continue
+                row_count += 1
+                workout_keys.add((title, date_text, duration))
+                try:
+                    parsed = datetime.strptime(date_text, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if last_date is None or parsed > last_date:
+                    last_date = parsed
+            return {"rows": row_count, "workouts": len(workout_keys), "last_date": last_date}
+    except OSError:
+        return None
 
 
 def fit_crc(data):
@@ -139,7 +183,11 @@ def fit_string(value, size):
 
 
 def parse_duration(value):
-    parts = [int(part) for part in (value or "0:0:0").split(":")]
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    parts = [int(float(part)) for part in str(value or "0:0:0").split(":")]
     if len(parts) == 3:
         hours, minutes, seconds = parts
         return hours * 3600 + minutes * 60 + seconds
@@ -147,6 +195,13 @@ def parse_duration(value):
         minutes, seconds = parts
         return minutes * 60 + seconds
     return parts[0] if parts else 0
+
+
+def format_duration(seconds):
+    total = max(0, int(seconds or 0))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}:{minutes}:{secs}"
 
 
 def parse_float(value):
@@ -316,6 +371,199 @@ def load_lyfta_workouts(csv_path):
     return sorted(grouped.values(), key=lambda item: item["started_at"])
 
 
+def fetch_lyfta_workouts_from_api(api_key, days_back=30):
+    """Fetch workouts from Lyfta API and return in the same format as load_lyfta_workouts."""
+    if not api_key:
+        return []
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    workouts = []
+    page = 1
+    limit = 100
+    after_datetime = datetime.now() - timedelta(days=days_back)
+
+    while True:
+        params = {"limit": limit, "page": page}
+        response = requests.get(
+            f"{LYFTA_API_BASE}/api/v1/workouts",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        batch = data.get("workouts") or data.get("data") or []
+        if not batch:
+            break
+
+        saw_older_than_window = False
+        for workout in batch:
+            perform_date = workout.get("workout_perform_date", "")
+            if not perform_date:
+                continue
+
+            try:
+                started_at = datetime.strptime(perform_date[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                try:
+                    started_at = datetime.fromisoformat(perform_date.replace("Z", "+00:00"))
+                    started_at = started_at.replace(tzinfo=None)
+                except ValueError:
+                    continue
+
+            if started_at < after_datetime:
+                saw_older_than_window = True
+                continue
+
+            title = workout.get("title", "Strength Training")
+            duration = parse_duration(
+                workout.get("duration")
+                or workout.get("workout_duration")
+                or workout.get("total_duration")
+                or ""
+            )
+
+            sets = []
+            for exercise in workout.get("exercises", []):
+                exc_name = (
+                    exercise.get("excercise_name")
+                    or exercise.get("exercise_name")
+                    or exercise.get("name")
+                    or "Exercise"
+                )
+                for set_data in exercise.get("sets", []):
+                    reps_str = set_data.get("reps", "")
+                    weight_str = set_data.get("weight", "")
+                    set_type = set_data.get("set_type") or set_data.get("set_type_id") or ""
+
+                    if not reps_str and not weight_str:
+                        continue
+
+                    reps = parse_int(reps_str)
+                    weight = parse_float(weight_str)
+
+                    if reps is None and weight is None:
+                        continue
+
+                    sets.append({
+                        "exercise": exc_name.strip(),
+                        "reps": reps or 0,
+                        "weight": weight or 0.0,
+                        "set_type": str(set_type).strip(),
+                    })
+
+            if sets:
+                if duration <= 0:
+                    duration = planned_sets_duration_seconds(sets)
+                workouts.append({
+                    "source_id": str(workout.get("id") or ""),
+                    "title": title,
+                    "started_at": started_at,
+                    "duration": duration,
+                    "sets": sets,
+                })
+
+        if page >= data.get("total_pages", 1):
+            break
+        if saw_older_than_window and len(batch) < limit:
+            break
+        page += 1
+
+    return sorted(workouts, key=lambda item: item["started_at"])
+
+
+def update_lyfta_csv_from_api(csv_path, api_key, days_back=30, log=None):
+    """Fetch workouts from Lyfta API and update the CSV file."""
+    if log is None:
+        log = print
+
+    log(f"Fetching workouts from Lyfta API (last {days_back} days)...")
+    lyfta_workouts = fetch_lyfta_workouts_from_api(api_key, days_back)
+
+    if not lyfta_workouts:
+        log("No workouts found from Lyfta API.")
+        return 0
+
+    path = Path(csv_path)
+    if not path.is_absolute():
+        path = ROOT / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_rows = []
+    if path.exists():
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames:
+                reader.fieldnames = [name.strip() for name in reader.fieldnames]
+                for raw in reader:
+                    row = {key.strip(): value for key, value in raw.items()}
+                    existing_rows.append(row)
+
+    existing_keys = set()
+    for row in existing_rows:
+        date_text = row.get("Date", "").strip()
+        title = row.get("Title", "").strip()
+        if date_text and title:
+            existing_keys.add((title, date_text))
+
+    new_rows = []
+    added_workout_keys = set()
+    for workout in lyfta_workouts:
+        started_at = workout["started_at"]
+        date_str = started_at.strftime("%Y-%m-%d %H:%M:%S")
+        title = workout["title"]
+        duration = format_duration(workout.get("duration", 0))
+
+        key = (title, date_str)
+        if key in existing_keys:
+            continue
+        added_workout_keys.add(key)
+
+        for set_info in workout["sets"]:
+            new_rows.append({
+                "Date": date_str,
+                "Title": title,
+                "Duration": duration,
+                "Exercise": set_info["exercise"],
+                "Reps": str(set_info["reps"]),
+                "Weight": str(set_info["weight"]),
+                "Set Type": set_info["set_type"],
+            })
+
+    if not new_rows:
+        log("No new workouts to add to CSV.")
+        return 0
+
+    all_rows = existing_rows + new_rows
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=LYFTA_CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    log(f"Updated {path}: added {len(new_rows)} set rows from {len(added_workout_keys)} workouts.")
+    return len(added_workout_keys)
+
+
+def maybe_update_lyfta_csv_from_api(values, log):
+    api_key = str(values.get("LYFTA_API_KEY", "")).strip()
+    if not api_key:
+        log("Lyfta API key is not set; using existing CSV only.")
+        return 0
+    try:
+        days_back = int(str(values.get("LYFTA_API_DAYS_BACK", "3650")).strip() or "3650")
+    except ValueError:
+        raise ValueError("Lyfta API Days Back must be a whole number.")
+    if days_back <= 0:
+        raise ValueError("Lyfta API Days Back must be greater than 0.")
+    return update_lyfta_csv_from_api(
+        values.get("LYFTA_CSV") or "WorkoutData.csv",
+        api_key,
+        days_back,
+        log,
+    )
+
+
 def build_direct_workouts(lyfta_workouts):
     """Convert Lyfta CSV workouts into the small activity shape used for FIT export."""
     local_tz = datetime.now().astimezone().tzinfo
@@ -323,7 +571,7 @@ def build_direct_workouts(lyfta_workouts):
     for workout in lyfta_workouts:
         started_at = workout["started_at"]
         utc_started_at = started_at.replace(tzinfo=local_tz).astimezone(timezone.utc)
-        identity = "{}|{}|{}".format(
+        identity = workout.get("source_id") or "{}|{}|{}".format(
             started_at.isoformat(), workout.get("title", ""), workout.get("duration", 0),
         )
         activities.append({
@@ -782,10 +1030,15 @@ def validate_values(values, require_garmin=True):
 def validate_direct_values(values):
     if not values.get("GARMIN_EMAIL") or not values.get("GARMIN_PASSWORD"):
         raise ValueError("Garmin email and password are required.")
-    csv_path = Path(values.get("LYFTA_CSV") or "WorkoutData.csv")
-    if not csv_path.is_absolute():
-        csv_path = ROOT / csv_path
-    if not csv_path.exists():
+    api_key = str(values.get("LYFTA_API_KEY", "")).strip()
+    try:
+        days_back = int(str(values.get("LYFTA_API_DAYS_BACK", "3650")).strip() or "3650")
+    except ValueError:
+        raise ValueError("Lyfta API Days Back must be a whole number.")
+    if days_back <= 0:
+        raise ValueError("Lyfta API Days Back must be greater than 0.")
+    csv_path = resolve_csv_path(values.get("LYFTA_CSV") or "WorkoutData.csv")
+    if not api_key and not csv_path.exists():
         raise ValueError("Lyfta CSV was not found: {}".format(csv_path))
 
 
@@ -904,6 +1157,7 @@ def run_sync(values, log, ask_strava_code=None, ask_garmin_mfa=None, open_browse
     workouts = fetch_strava_workouts(token, days_back)
     log("Found {} strength-type workouts.".format(len(workouts)))
 
+    maybe_update_lyfta_csv_from_api(values, log)
     lyfta_workouts = load_lyfta_workouts(values["LYFTA_CSV"])
     log("Loaded {} Lyfta CSV workouts with set data.".format(len(lyfta_workouts)))
 
@@ -1033,6 +1287,7 @@ def run_sync(values, log, ask_strava_code=None, ask_garmin_mfa=None, open_browse
 def run_direct_sync(values, log, ask_garmin_mfa=None, dry_run=False, resync_existing=False):
     """Upload Lyfta CSV workouts directly to Garmin without using Strava."""
     validate_direct_values(values)
+    maybe_update_lyfta_csv_from_api(values, log)
     lyfta_workouts = load_lyfta_workouts(values.get("LYFTA_CSV") or "WorkoutData.csv")
     workouts = build_direct_workouts(lyfta_workouts)
     log("Loaded {} Lyfta CSV workouts for direct Garmin sync.".format(len(workouts)))
@@ -1168,6 +1423,8 @@ class App:
         self.garmin_password = StringVar(value=env.get("GARMIN_PASSWORD", ""))
         self.callback_url = StringVar(value=env.get("STRAVA_CALLBACK_URL", "http://localhost"))
         self.lyfta_csv = StringVar(value=env.get("LYFTA_CSV", "WorkoutData.csv"))
+        self.lyfta_api_key = StringVar(value=env.get("LYFTA_API_KEY", ""))
+        self.lyfta_api_days_back = StringVar(value=env.get("LYFTA_API_DAYS_BACK", "3650"))
         self.days_back = StringVar(value=env.get("DAYS_BACK", "30"))
         self.user_weight_kg = StringVar(value=env.get("USER_WEIGHT_KG", ""))
         self.strength_met = StringVar(value=env.get("STRENGTH_MET", "5.0"))
@@ -1191,13 +1448,15 @@ class App:
         self.add_field(outer, 4, "Garmin Password", self.garmin_password, show="*")
         self.add_field(outer, 5, "Callback URL", self.callback_url)
         self.add_field(outer, 6, "Lyfta CSV", self.lyfta_csv)
-        self.add_field(outer, 7, "Days Back", self.days_back, width=12)
-        self.add_field(outer, 8, "User Weight KG", self.user_weight_kg, width=12)
-        self.add_field(outer, 9, "Strength MET", self.strength_met, width=12)
-        self.add_field(outer, 10, "Daily Sync Time", self.daily_sync_time, width=12)
+        self.add_field(outer, 7, "Lyfta API Key", self.lyfta_api_key, show="*")
+        self.add_field(outer, 8, "Lyfta API Days Back", self.lyfta_api_days_back, width=12)
+        self.add_field(outer, 9, "Strava Days Back", self.days_back, width=12)
+        self.add_field(outer, 10, "User Weight KG", self.user_weight_kg, width=12)
+        self.add_field(outer, 11, "Strength MET", self.strength_met, width=12)
+        self.add_field(outer, 12, "Daily Sync Time", self.daily_sync_time, width=12)
 
         buttons = Frame(outer)
-        buttons.grid(row=11, column=0, columnspan=3, sticky=W, pady=(12, 8))
+        buttons.grid(row=13, column=0, columnspan=3, sticky=W, pady=(12, 8))
         self.save_button = Button(buttons, text="Save Config", width=16, command=self.save_config)
         self.save_button.pack(side="left", padx=(0, 8))
         self.run_button = Button(buttons, text="Run Sync", width=16, command=self.start_sync)
@@ -1214,7 +1473,7 @@ class App:
         self.resync_button.pack(side="left")
 
         service_buttons = Frame(outer)
-        service_buttons.grid(row=12, column=0, columnspan=3, sticky=W, pady=(0, 12))
+        service_buttons.grid(row=14, column=0, columnspan=3, sticky=W, pady=(0, 12))
         self.install_task_button = Button(service_buttons, text="Install Daily Sync", width=18, command=self.install_daily_sync)
         self.install_task_button.pack(side="left", padx=(0, 8))
         self.uninstall_task_button = Button(service_buttons, text="Remove Daily Sync", width=18, command=self.uninstall_daily_sync)
@@ -1226,13 +1485,13 @@ class App:
         self.open_log_button = Button(service_buttons, text="Open Log", width=12, command=self.open_daily_log)
         self.open_log_button.pack(side="left")
 
-        Label(outer, textvariable=self.status, anchor="w").grid(row=13, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        Label(outer, textvariable=self.status, anchor="w").grid(row=15, column=0, columnspan=3, sticky="ew", pady=(0, 6))
 
         self.log = ScrolledText(outer, height=18, wrap="word", state=DISABLED)
-        self.log.grid(row=14, column=0, columnspan=3, sticky="nsew")
+        self.log.grid(row=16, column=0, columnspan=3, sticky="nsew")
 
         outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(14, weight=1)
+        outer.rowconfigure(16, weight=1)
 
     def add_field(self, parent, row, label, variable, show=None, width=48):
         Label(parent, text=label).grid(row=row, column=0, sticky=W, pady=4, padx=(0, 10))
@@ -1248,6 +1507,8 @@ class App:
             "GARMIN_PASSWORD": self.garmin_password.get(),
             "STRAVA_CALLBACK_URL": self.callback_url.get().strip() or "http://localhost",
             "LYFTA_CSV": self.lyfta_csv.get().strip() or "WorkoutData.csv",
+            "LYFTA_API_KEY": self.lyfta_api_key.get().strip(),
+            "LYFTA_API_DAYS_BACK": self.lyfta_api_days_back.get().strip() or "3650",
             "DAYS_BACK": self.days_back.get().strip() or "30",
             "USER_WEIGHT_KG": self.user_weight_kg.get().strip(),
             "STRENGTH_MET": self.strength_met.get().strip() or "5.0",
@@ -1315,13 +1576,15 @@ class App:
         except ValueError as exc:
             messagebox.showerror("Invalid Config", str(exc))
             return
+        if not self.save_config():
+            return
         self.set_running(True)
         self.worker = threading.Thread(target=self.run_direct_sync, daemon=True)
         self.worker.start()
 
     def start_resync(self):
         try:
-            self.validate_config(require_garmin=True)
+            validate_direct_values(self.config())
         except ValueError as exc:
             messagebox.showerror("Invalid Config", str(exc))
             return
@@ -1333,7 +1596,7 @@ class App:
         if not self.save_config():
             return
         self.set_running(True)
-        self.worker = threading.Thread(target=lambda: self.run_sync(resync_existing=True), daemon=True)
+        self.worker = threading.Thread(target=lambda: self.run_direct_sync(resync_existing=True), daemon=True)
         self.worker.start()
 
     def set_running(self, running):
@@ -1386,7 +1649,11 @@ class App:
 
     def start_headless_sync(self):
         try:
-            self.validate_config(require_garmin=True)
+            values = self.config()
+            if str(values.get("SYNC_MODE", "direct")).strip().lower() == "direct":
+                validate_direct_values(values)
+            else:
+                self.validate_config(require_garmin=True)
         except ValueError as exc:
             messagebox.showerror("Invalid Config", str(exc))
             return
@@ -1436,7 +1703,7 @@ class App:
         finally:
             self.root.after(0, lambda: self.set_running(False))
 
-    def run_direct_sync(self):
+    def run_direct_sync(self, resync_existing=False):
         try:
             run_direct_sync(
                 self.config(),
@@ -1445,6 +1712,7 @@ class App:
                     "Garmin 2FA",
                     "Enter the Garmin 2FA code from your email/app:",
                 ) or "",
+                resync_existing=resync_existing,
             )
         except Exception as exc:
             self.log_line("ERROR: {}".format(exc))
