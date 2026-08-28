@@ -523,26 +523,32 @@ def update_lyfta_csv_from_api(csv_path, api_key, days_back=30, log=None):
                     row = {key.strip(): value for key, value in raw.items()}
                     existing_rows.append(row)
 
-    existing_dates = set()
+    existing_dates = {
+        row.get("Date", "").strip()
+        for row in existing_rows
+        if row.get("Date", "").strip()
+    }
+    refresh_after = datetime.now() - timedelta(days=days_back)
+    retained_rows = []
     for row in existing_rows:
-        date_text = row.get("Date", "").strip()
-        if date_text:
-            existing_dates.add(date_text)
+        try:
+            row_date = datetime.strptime(row.get("Date", "").strip(), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            retained_rows.append(row)
+            continue
+        if row_date < refresh_after:
+            retained_rows.append(row)
 
-    new_rows = []
-    added_workout_keys = set()
+    api_rows = []
+    api_dates = set()
     for workout in lyfta_workouts:
         started_at = workout["started_at"]
         date_str = started_at.strftime("%Y-%m-%d %H:%M:%S")
+        api_dates.add(date_str)
         title = workout["title"]
         duration = format_duration(workout.get("duration", 0))
-
-        if date_str in existing_dates:
-            continue
-        added_workout_keys.add(date_str)
-
         for set_info in workout["sets"]:
-            new_rows.append({
+            api_rows.append({
                 "Date": date_str,
                 "Title": title,
                 "Duration": duration,
@@ -552,18 +558,25 @@ def update_lyfta_csv_from_api(csv_path, api_key, days_back=30, log=None):
                 "Set Type": set_info["set_type"],
             })
 
-    if not new_rows:
-        log("No new workouts to add to CSV.")
+    all_rows = retained_rows + api_rows
+    if all_rows == existing_rows:
+        log("WorkoutData.csv is already current.")
         return 0
 
-    all_rows = existing_rows + new_rows
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=LYFTA_CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_rows)
+    temp_path.replace(path)
 
-    log(f"Updated {path}: added {len(new_rows)} set rows from {len(added_workout_keys)} workouts.")
-    return len(added_workout_keys)
+    added_workouts = len(api_dates - existing_dates)
+    replaced_workouts = len(api_dates & existing_dates)
+    log(
+        f"Refreshed {path}: {len(api_rows)} set rows from {len(api_dates)} API workouts "
+        f"({added_workouts} new, {replaced_workouts} updated)."
+    )
+    return added_workouts
 
 
 def maybe_update_lyfta_csv_from_api(values, log):

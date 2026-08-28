@@ -55,6 +55,37 @@ class DirectWorkoutBuildTests(unittest.TestCase):
         self.assertEqual(workouts[0]["sets"][0]["reps"], 8)
         self.assertEqual(workouts[0]["sets"][0]["weight"], 100.0)
 
+    def test_refresh_replaces_existing_workout_rows_when_lyfta_changes(self):
+        original = {
+            "source_id": "lyfta-456",
+            "title": "Pull day",
+            "started_at": datetime(2026, 8, 26, 18, 30, 0),
+            "duration": 3600,
+            "sets": [{"exercise": "Row", "reps": 8, "weight": 70.0, "set_type": "0"}],
+        }
+        updated = {
+            **original,
+            "duration": 4200,
+            "sets": [
+                {"exercise": "Row", "reps": 10, "weight": 75.0, "set_type": "0"},
+                {"exercise": "Pulldown", "reps": 12, "weight": 60.0, "set_type": "0"},
+            ],
+        }
+
+        with TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "WorkoutData.csv"
+            with patch("lyfta_garmin_app.fetch_lyfta_workouts_from_api", side_effect=[[original], [updated]]):
+                self.assertEqual(update_lyfta_csv_from_api(csv_path, "fake-key", 3650), 1)
+                self.assertEqual(update_lyfta_csv_from_api(csv_path, "fake-key", 3650), 0)
+            workouts = load_lyfta_workouts(csv_path)
+
+        self.assertEqual(len(workouts), 1)
+        self.assertEqual(workouts[0]["duration"], 4200)
+        self.assertEqual(
+            [(set_info["exercise"], set_info["reps"], set_info["weight"]) for set_info in workouts[0]["sets"]],
+            [("Row", 10, 75.0), ("Pulldown", 12, 60.0)],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
