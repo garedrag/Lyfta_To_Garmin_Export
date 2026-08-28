@@ -9,8 +9,14 @@ Core rules:
 1. Keep a neutral lumbar spine.
 2. Avoid loaded spinal flexion, twisting, and heavy axial loading.
 3. Prefer machines, cables, chest-supported rows, and seated work with back support.
-4. Rest 3 minutes on large compound/machine lifts and 2 minutes on isolation/core work.
+4. Rest 5 minutes on the heaviest main sets, 4 minutes on compound/machine work, and 3 minutes on isolation/core work. Use at least 3 minutes when changing exercises.
 5. Use 1-3 reps in reserve. No grinders.
+
+Rest map:
+
+- 5 min: heavy Bench Press work sets and Sled 45 Degree Leg Press work sets.
+- 4 min: incline press, seated shoulder press, lat pulldown, supported rows, seated row, and secondary leg press/supported split squat.
+- 3 min: lateral raise, fly/pec deck, triceps, curls, leg curls/extensions, calves, Pallof press, dead bug, bird dog, side plank, warm-up and mobility work.
 
 ## DAY A - PUSH
 
