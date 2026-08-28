@@ -9,14 +9,14 @@ Core rules:
 1. Keep a neutral lumbar spine.
 2. Avoid loaded spinal flexion, twisting, and heavy axial loading.
 3. Prefer machines, cables, chest-supported rows, and seated work with back support.
-4. Rest 3-5 minutes. Start each exercise with a shorter 3-minute rest after the first set, use 3-4 minutes through the middle sets, and take the longest 5-minute rest before the final hard set.
+4. Rest by muscle-group size and set difficulty: smaller muscles use shorter pauses, bigger muscle groups and heavier sets use longer pauses.
 5. Use 1-3 reps in reserve. No grinders.
 
 Rest map:
 
-- 3 min: after the first set of each exercise, isolation/core work, warm-up and mobility work.
-- 4 min: middle sets on compound/machine work such as incline press, seated shoulder press, lat pulldown, supported rows, seated row, and secondary leg press/supported split squat.
-- 5 min: before the final hard set on multi-set exercises, especially Bench Press and Sled 45 Degree Leg Press.
+- 2-3 min: small muscles and core - lateral raise, face pull, curls, triceps, calves, Pallof press, dead bug, bird dog, side plank, warm-up and mobility work.
+- 3-4 min: medium compound/machine work - incline press, seated shoulder press, cable rows, leg curls/extensions, and supported split squat.
+- 4-5 min: large muscle groups and heavy work - Bench Press, lat pulldown, chest-supported rows, seated row, and Sled 45 Degree Leg Press. Use 5 min before the final hard set.
 
 ## DAY A - PUSH
 
